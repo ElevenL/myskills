@@ -1,11 +1,11 @@
 ---
 name: USDA Reports
-description: Tools for fetching USDA agricultural reports including WASDE supply/demand data, crop progress, and condition reports. Use when user asks for: (1) WASDE soybean/corn supply and demand data, (2) US crop progress reports, (3) Crop condition ratings, (4) USDA PSD data, (5) NASS QuickStats data.
+description: Tools for fetching USDA agricultural reports including WASDE supply/demand data, crop progress, and condition reports. Use when user asks for: (1) WASDE soybean/corn supply and demand data, (2) US crop progress reports, (3) Crop condition ratings, (4) USDA PSD data, (5) NASS QuickStats data, (6) USDA report schedules/calendar.
 ---
 
 # USDA Reports Skill
 
-This skill provides tools to fetch USDA agricultural reports including Production, Supply, and Distribution (PSD) data and NASS QuickStats crop progress data.
+This skill provides tools to fetch USDA agricultural reports including Production, Supply, and Distribution (PSD) data, NASS QuickStats crop progress data, and report schedules.
 
 ## Quick Start
 
@@ -40,6 +40,39 @@ python scripts/crop_progress.py progress --commodity SOYBEANS --unit PLANTED --y
 python scripts/crop_progress.py progress --commodity SOYBEANS --unit HARVESTED --year 2024
 python scripts/crop_progress.py progress --commodity SOYBEANS --unit BLOOMING --year 2024
 ```
+
+### Report Schedule (Calendar)
+
+Query USDA NASS report release schedules:
+
+```bash
+# Show all scheduled reports
+python scripts/report_schedule.py list
+
+# Show upcoming reports (next 30 days)
+python scripts/report_schedule.py upcoming
+
+# Show upcoming reports in next 7 days
+python scripts/report_schedule.py upcoming --days 7
+
+# Filter by report type
+python scripts/report_schedule.py list --type "Crop Production"
+python scripts/report_schedule.py list --type "Grain Stocks"
+python scripts/report_schedule.py list --type "Crop Progress"
+
+# Filter by date range
+python scripts/report_schedule.py list --start 2026-04-01 --end 2026-06-30
+
+# Show available report types
+python scripts/report_schedule.py types
+```
+
+Available report types:
+- **Prospective Plantings** (种植意向报告) - Released in March/April
+- **Acreage** (种植面积确认报告) - Released in June/July
+- **Grain Stocks** (季度库存报告) - Quarterly (Jan, Apr, Jul, Oct)
+- **Crop Production** (月度作物产量报告/月度供需报告) - Monthly
+- **Crop Progress** (作物进展报告/作物优良率报告) - Weekly during growing season
 
 ### Raw API Access
 
