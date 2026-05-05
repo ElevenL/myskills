@@ -146,7 +146,7 @@ class MarketDashboard:
         从数据库读取数据
 
         返回:
-            (kline_df, macro_df, flow_df, liq_df) 元组
+            (kline_df, macro_df, flow_df, liq_df, ratio_df) 元组
         """
         if not self.connection:
             raise RuntimeError("请先调用 connect() 建立数据库连接")
@@ -183,12 +183,25 @@ class MarketDashboard:
             parse_dates=['event_time']
         )
 
-        print(f"✅ 宏观指标: {len(macro_df)} 条, 爆仓: {len(liq_df)} 条")
-        return kline_df, macro_df, flow_df, liq_df
+        # 查询多空比数据 (使用 PERP symbol)
+        query_ratio = """
+            SELECT event_time, global_account_ratio, top_position_ratio
+            FROM long_short_ratio
+            WHERE symbol = %s AND event_time >= %s
+            ORDER BY event_time ASC
+        """
+        ratio_df = pd.read_sql(
+            query_ratio, self.connection,
+            params=(perp_symbol, start_time),
+            parse_dates=['event_time']
+        )
+
+        print(f"✅ 宏观指标: {len(macro_df)} 条, 爆仓: {len(liq_df)} 条, 多空比: {len(ratio_df)} 条")
+        return kline_df, macro_df, flow_df, liq_df, ratio_df
 
     def plot(self, hours: int = 24):
         """绑制双子图"""
-        kline_df, macro_df, flow_df, liq_df = self.fetch_data(hours)
+        kline_df, macro_df, flow_df, liq_df, ratio_df = self.fetch_data(hours)
 
         if kline_df.empty and macro_df.empty and flow_df.empty:
             print("⚠️ 无数据")
@@ -203,35 +216,97 @@ class MarketDashboard:
 
         fig.suptitle(f"{self.symbol} Market Dashboard ({self.interval}, last {hours} Hours)", fontsize=16, fontweight='bold')
 
-        # ========== 上图: K线、未平仓量、资金费率、爆仓 ==========
-        # 绘制K线价格
+        # ========== 上图: K线价格、买入/卖出量、累计净流量、爆仓 ==========
+        # 绘制K线价格（左Y轴）
         if not kline_df.empty:
             color_close = 'black'
-            color_high = '#27AE60'   # 绿色
-            color_low = '#E74C3C'    # 红色
 
             ax1.plot(kline_df['event_time'], kline_df['Close'],
                      color=color_close, linewidth=2.0, label='Close Price')
-            ax1.plot(kline_df['event_time'], kline_df['High'],
-                     color=color_high, linewidth=0.8, alpha=0.6, label='High Price')
-            ax1.plot(kline_df['event_time'], kline_df['Low'],
-                     color=color_low, linewidth=0.8, alpha=0.6, label='Low Price')
             ax1.set_ylabel('Price (USDT)', fontsize=11)
 
-        # 绘制未平仓量和资金费率
+        # 右Y轴1: 买入/卖出量柱状图
+        ax1_flow = None
+        if not flow_df.empty:
+            ax1_flow = ax1.twinx()
+            color_buy = '#27AE60'
+            color_sell = '#E74C3C'
+
+            # 计算柱宽（根据 interval 参数，系数0.8让柱子更密集）
+            bar_width = self._interval_to_seconds() / 86400 * 0.8
+
+            # 柱状图: 买入/卖出
+            ax1_flow.bar(flow_df['event_time'], flow_df['buy_volume'],
+                         width=bar_width, alpha=0.4, color=color_buy, label='Buy Volume')
+            ax1_flow.bar(flow_df['event_time'], -flow_df['sell_volume'],
+                         width=bar_width, alpha=0.4, color=color_sell, label='Sell Volume')
+            ax1_flow.set_ylabel('Volume (BTC)', fontsize=11)
+            ax1_flow.spines['right'].set_position(('outward', 60))
+
+        # 右Y轴2: 累计净流量折线
+        ax1_cumsum = None
+        if not flow_df.empty:
+            ax1_cumsum = ax1.twinx()
+            color_cumsum = '#F39C12'  # 橙色
+
+            cumsum_net = flow_df['net_flow'].cumsum()
+            ax1_cumsum.plot(flow_df['event_time'], cumsum_net,
+                            color=color_cumsum, linewidth=2.0, linestyle='-', label='Cumulative Net Flow')
+            ax1_cumsum.set_ylabel('Cumulative Net Flow (BTC)', color=color_cumsum, fontsize=11)
+            ax1_cumsum.tick_params(axis='y', labelcolor=color_cumsum)
+
+        # 爆仓散点图
+        if not liq_df.empty:
+            color_liq_short = '#2ECC71'  # 绿色 - 空头爆仓 (BUY)
+            color_liq_long = '#E74C3C'   # 红色 - 多头爆仓 (SELL)
+
+            # 分离空头和多头爆仓
+            liq_short = liq_df[liq_df['side'] == 'BUY']   # 空头爆仓
+            liq_long = liq_df[liq_df['side'] == 'SELL']   # 多头爆仓
+
+            # 计算散点大小 (基于金额)
+            def calc_sizes(values, scale=0.5, min_size=20, max_size=500):
+                """根据金额计算散点大小"""
+                sizes = np.sqrt(values / 1000) * scale * 100
+                return np.clip(sizes, min_size, max_size)
+
+            # 绘制空头爆仓 (绿色)
+            if len(liq_short) > 0:
+                ax1.scatter(liq_short['event_time'], liq_short['price'],
+                            s=calc_sizes(liq_short['value_usd'].values),
+                            c=color_liq_short, alpha=0.5, edgecolors='white', linewidths=0.5)
+
+            # 绘制多头爆仓 (红色)
+            if len(liq_long) > 0:
+                ax1.scatter(liq_long['event_time'], liq_long['price'],
+                            s=calc_sizes(liq_long['value_usd'].values),
+                            c=color_liq_long, alpha=0.5, edgecolors='white', linewidths=0.5)
+
+        ax1.set_title('Price / Flow / Liquidations', fontsize=12)
+        ax1.grid(True, linestyle='--', alpha=0.3)
+
+        # 上图图例
+        legend_elements_top = [
+            plt.Line2D([0], [0], color='black', linewidth=2.0, label='Close Price'),
+            Patch(facecolor='#27AE60', alpha=0.4, label='Buy Volume'),
+            Patch(facecolor='#E74C3C', alpha=0.4, label='Sell Volume'),
+            plt.Line2D([0], [0], color='#F39C12', linewidth=2.0, label='Cumulative Net Flow'),
+            plt.scatter([], [], c='#2ECC71', s=50, alpha=0.5, label='Short Liq'),
+            plt.scatter([], [], c='#E74C3C', s=50, alpha=0.5, label='Long Liq'),
+        ]
+        ax1.legend(handles=legend_elements_top, loc='upper left', fontsize=9)
+
+        # ========== 下图: 资金费率、未平仓合约量、多空比 ==========
         if not macro_df.empty:
-
-            # 右Y轴1: 未平仓量
-            ax1_oi = ax1.twinx()
+            # 未平仓量（左Y轴）
             color_oi = '#3498DB'
-            ax1_oi.plot(macro_df['event_time'], macro_df['open_interest'] / 1e3,
-                        color=color_oi, linewidth=1.5, label='OI')
-            ax1_oi.set_ylabel('OI (K BTC)', color=color_oi, fontsize=11)
-            ax1_oi.tick_params(axis='y', labelcolor=color_oi)
-            ax1_oi.spines['right'].set_position(('outward', 60))
+            ax2.plot(macro_df['event_time'], macro_df['open_interest'] / 1e3,
+                     color=color_oi, linewidth=2.0, label='Open Interest')
+            ax2.set_ylabel('OI (K BTC)', color=color_oi, fontsize=11)
+            ax2.tick_params(axis='y', labelcolor=color_oi)
 
-            # 右Y轴2: 资金费率柱状图
-            ax1_fr = ax1.twinx()
+            # 资金费率柱状图（右Y轴1）
+            ax2_fr = ax2.twinx()
             color_fr_pos = '#E74C3C'  # 红色 - 正费率
             color_fr_neg = '#9B59B6'  # 紫色 - 负费率
 
@@ -241,104 +316,54 @@ class MarketDashboard:
             # 计算柱宽（根据 interval 参数）
             bar_width_fr = self._interval_to_seconds() / 86400 * 0.8
 
-            ax1_fr.bar(macro_df['event_time'], funding_pct,
+            ax2_fr.bar(macro_df['event_time'], funding_pct,
                        width=bar_width_fr, alpha=0.6, color=colors_fr)
 
-            ax1_fr.set_ylabel('Funding Rate (%)', fontsize=11)
-            ax1_fr.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+            ax2_fr.set_ylabel('Funding Rate (%)', fontsize=11)
+            ax2_fr.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
 
             # 设置资金费率 Y 轴范围，确保 0 在中间
             funding_max = max(abs(funding_pct.min()), abs(funding_pct.max())) * 1.2
-            ax1_fr.set_ylim(-funding_max, funding_max)
+            ax2_fr.set_ylim(-funding_max, funding_max)
 
-            # 爆仓散点图
-            if not liq_df.empty:
-                color_liq_short = '#2ECC71'  # 绿色 - 空头爆仓 (BUY)
-                color_liq_long = '#E74C3C'   # 红色 - 多头爆仓 (SELL)
+            # 右Y轴2: 多空比折线
+            ax2_fr.spines['right'].set_position(('outward', 60))
 
-                # 分离空头和多头爆仓
-                liq_short = liq_df[liq_df['side'] == 'BUY']   # 空头爆仓
-                liq_long = liq_df[liq_df['side'] == 'SELL']   # 多头爆仓
+        # 绘制多空比数据（右Y轴2）
+        if not ratio_df.empty:
+            ax2_ratio = ax2.twinx()
+            color_global = '#E67E22'   # 橙色 - 全球账户多空比
+            color_top = '#16A085'      # 青色 - 大户持仓多空比
 
-                # 计算散点大小 (基于金额)
-                def calc_sizes(values, scale=0.5, min_size=20, max_size=500):
-                    """根据金额计算散点大小"""
-                    sizes = np.sqrt(values / 1000) * scale * 100
-                    return np.clip(sizes, min_size, max_size)
+            ax2_ratio.plot(ratio_df['event_time'], ratio_df['global_account_ratio'],
+                           color=color_global, linewidth=1.5, label='Global Account Ratio')
+            ax2_ratio.plot(ratio_df['event_time'], ratio_df['top_position_ratio'],
+                           color=color_top, linewidth=1.5, label='Top Position Ratio')
 
-                # 绘制空头爆仓 (绿色)
-                if len(liq_short) > 0:
-                    ax1.scatter(liq_short['event_time'], liq_short['price'],
-                                s=calc_sizes(liq_short['value_usd'].values),
-                                c=color_liq_short, alpha=0.5, edgecolors='white', linewidths=0.5)
+            # 1.0参考线（大于1看多，小于1看空）
+            ax2_ratio.axhline(y=1.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.7)
 
-                # 绘制多头爆仓 (红色)
-                if len(liq_long) > 0:
-                    ax1.scatter(liq_long['event_time'], liq_long['price'],
-                                s=calc_sizes(liq_long['value_usd'].values),
-                                c=color_liq_long, alpha=0.5, edgecolors='white', linewidths=0.5)
+            ax2_ratio.set_ylabel('Long/Short Ratio', fontsize=11)
 
-            ax1.set_title('K Lines / OI / Funding Rate / liquidations', fontsize=12)
-            ax1.grid(True, linestyle='--', alpha=0.3)
+            # 设置多空比 Y 轴范围
+            ratio_min = min(ratio_df['global_account_ratio'].min(),
+                           ratio_df['top_position_ratio'].min()) * 0.9
+            ratio_max = max(ratio_df['global_account_ratio'].max(),
+                           ratio_df['top_position_ratio'].max()) * 1.1
+            ax2_ratio.set_ylim(ratio_min, ratio_max)
 
-            # 图例
-            legend_elements = [
-                plt.Line2D([0], [0], color='black', linewidth=2.0, label='Close Price'),
-                plt.Line2D([0], [0], color='#27AE60', linewidth=0.8, alpha=0.6, label='High Price'),
-                plt.Line2D([0], [0], color='#E74C3C', linewidth=0.8, alpha=0.6, label='Low Price'),
-                plt.Line2D([0], [0], color=color_oi, linewidth=1.5, label='OI'),
-                Patch(facecolor=color_fr_pos, alpha=0.6, label='+Funding Rate'),
-                Patch(facecolor=color_fr_neg, alpha=0.6, label='-Funding Rate'),
-                plt.scatter([], [], c='#2ECC71', s=50, alpha=0.5, label='Short'),
-                plt.scatter([], [], c='#E74C3C', s=50, alpha=0.5, label='Long'),
-            ]
-            ax1.legend(handles=legend_elements, loc='upper left', fontsize=9)
+        ax2.set_title('Open Interest / Funding Rate / Long/Short Ratio', fontsize=12)
+        ax2.grid(True, linestyle='--', alpha=0.3)
 
-        # ========== 下图: 资金流向 ==========
-        if not flow_df.empty:
-            color_buy = '#27AE60'
-            color_sell = '#E74C3C'
-            color_net = '#9B59B6'
-            color_cumsum = '#F39C12'  # 橙色 - 累计净流量
-
-            # 计算柱宽（根据 interval 参数）
-            bar_width = self._interval_to_seconds() / 86400 * 0.35
-
-            # 柱状图: 买入/卖出
-            ax2.bar(flow_df['event_time'], flow_df['buy_volume'],
-                    width=bar_width, alpha=0.6, color=color_buy, label='Buy Volume')
-            ax2.bar(flow_df['event_time'], -flow_df['sell_volume'],
-                    width=bar_width, alpha=0.6, color=color_sell, label='Sell Volume')
-
-            # 右Y轴: 净流量折线
-            ax2_net = ax2.twinx()
-            ax2_net.plot(flow_df['event_time'], flow_df['net_flow'],
-                         color=color_net, linewidth=1.5, label='Net Flow')
-            ax2_net.set_ylabel('Net Flow (BTC)', color=color_net, fontsize=11)
-            ax2_net.tick_params(axis='y', labelcolor=color_net)
-            ax2_net.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
-
-            # 累计净流量虚线
-            cumsum_net = flow_df['net_flow'].cumsum()
-            ax2_net.plot(flow_df['event_time'], cumsum_net,
-                         color=color_cumsum, linewidth=1.5, linestyle='--', label='Total Net Flow')
-
-            y_max = max(flow_df['buy_volume'].max(), flow_df['sell_volume'].max()) * 1.1
-            ax2.set_ylim(-y_max, y_max)
-            ax2.set_ylabel('Volume (BTC)', fontsize=11)
-
-            ax2.set_title('Flow', fontsize=12)
-            ax2.grid(True, linestyle='--', alpha=0.3)
-            ax2.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
-
-            # 图例
-            legend_elements = [
-                Patch(facecolor=color_buy, alpha=0.6, label='Buy Volume'),
-                Patch(facecolor=color_sell, alpha=0.6, label='Sell Volume'),
-                plt.Line2D([0], [0], color=color_net, linewidth=1.5, label='Net Flow'),
-                plt.Line2D([0], [0], color=color_cumsum, linewidth=1.5, linestyle='--', label='Total Net Flow'),
-            ]
-            ax2.legend(handles=legend_elements, loc='upper left', fontsize=9)
+        # 下图图例
+        legend_elements_bottom = [
+            plt.Line2D([0], [0], color='#3498DB', linewidth=2.0, label='Open Interest'),
+            Patch(facecolor='#E74C3C', alpha=0.6, label='+Funding Rate'),
+            Patch(facecolor='#9B59B6', alpha=0.6, label='-Funding Rate'),
+            plt.Line2D([0], [0], color='#E67E22', linewidth=1.5, label='Global Account Ratio'),
+            plt.Line2D([0], [0], color='#16A085', linewidth=1.5, label='Top Position Ratio'),
+        ]
+        ax2.legend(handles=legend_elements_bottom, loc='upper left', fontsize=9)
 
         # 格式化X轴
         ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
