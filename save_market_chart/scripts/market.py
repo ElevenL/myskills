@@ -4,8 +4,8 @@
 从 MySQL 数据库读取资金流向、资金费率、未平仓量数据，使用 matplotlib 绑制双子图。
 
 用法:
-    python market_dashboard.py              # 默认显示 BTCUSDT 最近 24 小时
-    python market_dashboard.py --symbol ETHUSDT --hours 48
+    python market_dashboard.py              # 默认显示 BTCUSDT 最近 24 小时，1分钟周期
+    python market_dashboard.py --symbol ETHUSDT --hours 48 --interval 5M
 """
 
 import os
@@ -18,15 +18,15 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Patch
 import pymysql
-import requests
 from dotenv import load_dotenv
 
 
 class MarketDashboard:
     """市场全景可视化器"""
 
-    def __init__(self, symbol: str = 'BTCUSDT'):
+    def __init__(self, symbol: str = 'BTCUSDT', interval: str = '1M'):
         self.symbol = symbol
+        self.interval = interval
         self.connection = None
         self._load_config()
         self._setup_chinese_font()
@@ -48,42 +48,83 @@ class MarketDashboard:
         plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
 
-    def fetch_klines(self, hours: int = 24) -> pd.DataFrame:
+    def _format_symbol_for_kline(self) -> str:
+        """将 BTCUSDT 格式转换为 BTC-USDT 格式"""
+        # 去掉 USDT 后缀，重新拼接
+        if self.symbol.endswith('USDT'):
+            base = self.symbol[:-4]  # BTCUSDT -> BTC
+            return f"{base}-USDT"
+        return self.symbol
+
+    def _format_symbol_for_perp(self) -> str:
+        """将 BTCUSDT 格式转换为 BTC-USDT-PERP 格式"""
+        return self._format_symbol_for_kline() + '-PERP'
+
+    def _interval_to_seconds(self) -> int:
+        """将 interval 字符串转换为秒数"""
+        interval_map = {
+            '1M': 60,
+            '5M': 300,
+            '15M': 900,
+            '30M': 1800,
+            '60M': 3600,
+            '1H': 3600,
+            '4H': 14400,
+            'DAY': 86400,
+            '1D': 86400,
+        }
+        return interval_map.get(self.interval, 60)
+
+    def fetch_klines_and_flow(self, hours: int = 24) -> tuple:
         """
-        从币安 API 获取 K 线数据
+        从数据库 crypto_kline 表获取 K 线数据和资金流向数据（一次查询）
 
         返回:
-            包含 Open, High, Low, Close 的 DataFrame
+            (kline_df, flow_df) 元组
         """
-        limit = (hours * 60) // 5  # 5分钟K线，计算需要的数量
+        if not self.connection:
+            raise RuntimeError("请先调用 connect() 建立数据库连接")
 
-        url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": self.symbol,
-            "interval": "5m",
-            "limit": min(limit, 1000)  # 币安最大1000条
-        }
+        start_time = datetime.now() - timedelta(hours=hours)
+        kline_symbol = self._format_symbol_for_kline()
+
+        query = """
+            SELECT bar_time as event_time, open, high, low, close, volume,
+                   large_buy_vol + small_buy_vol as buy_volume,
+                   large_sell_vol + small_sell_vol as sell_volume,
+                   large_buy_vol + small_buy_vol - large_sell_vol - small_sell_vol as net_flow
+            FROM crypto_kline
+            WHERE symbol = %s AND exchange = 'BINANCE' AND kline_type = %s
+                  AND bar_time >= %s
+            ORDER BY bar_time ASC
+        """
 
         try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
+            kline_type = f'K_{self.interval}'
+            df = pd.read_sql(
+                query, self.connection,
+                params=(kline_symbol, kline_type, start_time),
+                parse_dates=['event_time']
+            )
 
-            columns = ["Open time", "Open", "High", "Low", "Close", "Volume",
-                       "Close time", "Quote asset volume", "Number of trades",
-                       "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"]
-            df = pd.DataFrame(response.json(), columns=columns)
+            # K线数据
+            kline_df = df[['event_time', 'open', 'high', 'low', 'close', 'volume']].copy()
+            kline_df.rename(columns={
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume'
+            }, inplace=True)
 
-            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms', utc=True)
-            df['Open time'] = df['Open time'].dt.tz_convert('Asia/Shanghai')  # 转换为北京时间
-            df['Open time'] = df['Open time'].dt.tz_localize(None)  # 移除时区信息，便于绑图
-            df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric)
-            df.rename(columns={'Open time': 'event_time'}, inplace=True)
+            # 资金流向数据
+            flow_df = df[['event_time', 'buy_volume', 'sell_volume', 'net_flow']].copy()
 
-            print(f"✅ K线数据: {len(df)} 条")
-            return df[['event_time', 'Open', 'High', 'Low', 'Close', 'Volume']]
+            print(f"✅ K线数据({self.interval}): {len(kline_df)} 条, 资金流向: {len(flow_df)} 条")
+            return kline_df, flow_df
         except Exception as e:
-            print(f"⚠️ K线数据获取失败: {e}")
-            return pd.DataFrame()
+            print(f"⚠️ K线/资金流向数据获取失败: {e}")
+            return pd.DataFrame(), pd.DataFrame()
 
     def connect(self):
         """建立数据库连接"""
@@ -111,11 +152,12 @@ class MarketDashboard:
             raise RuntimeError("请先调用 connect() 建立数据库连接")
 
         start_time = datetime.now() - timedelta(hours=hours)
+        perp_symbol = self._format_symbol_for_perp()
 
-        # 获取K线数据
-        kline_df = self.fetch_klines(hours)
+        # 获取K线数据和资金流向数据（一次查询）
+        kline_df, flow_df = self.fetch_klines_and_flow(hours)
 
-        # 查询宏观指标
+        # 查询宏观指标 (使用 PERP symbol)
         query_macro = """
             SELECT event_time, mark_price, open_interest, funding_rate
             FROM macro_indicators
@@ -124,24 +166,11 @@ class MarketDashboard:
         """
         macro_df = pd.read_sql(
             query_macro, self.connection,
-            params=(self.symbol, start_time),
+            params=(perp_symbol, start_time),
             parse_dates=['event_time']
         )
 
-        # 查询资金流向
-        query_flow = """
-            SELECT event_time, buy_volume, sell_volume, net_flow
-            FROM flow_stats
-            WHERE symbol = %s AND event_time >= %s
-            ORDER BY event_time ASC
-        """
-        flow_df = pd.read_sql(
-            query_flow, self.connection,
-            params=(self.symbol, start_time),
-            parse_dates=['event_time']
-        )
-
-        # 查询爆仓数据
+        # 查询爆仓数据 (使用 PERP symbol)
         query_liq = """
             SELECT event_time, side, price, value_usd
             FROM liquidations
@@ -150,30 +179,11 @@ class MarketDashboard:
         """
         liq_df = pd.read_sql(
             query_liq, self.connection,
-            params=(self.symbol, start_time),
+            params=(perp_symbol, start_time),
             parse_dates=['event_time']
         )
 
-        # 聚合为5分钟粒度
-        if not macro_df.empty:
-            macro_df.set_index('event_time', inplace=True)
-            macro_df = macro_df.resample('5min').agg({
-                'mark_price': 'last',
-                'open_interest': 'last',
-                'funding_rate': 'last'
-            }).dropna()
-            macro_df.reset_index(inplace=True)
-
-        if not flow_df.empty:
-            flow_df.set_index('event_time', inplace=True)
-            flow_df = flow_df.resample('5min').agg({
-                'buy_volume': 'sum',
-                'sell_volume': 'sum',
-                'net_flow': 'sum'
-            }).dropna()
-            flow_df.reset_index(inplace=True)
-
-        print(f"✅ 宏观指标: {len(macro_df)} 条, 资金流向: {len(flow_df)} 条, 爆仓: {len(liq_df)} 条")
+        print(f"✅ 宏观指标: {len(macro_df)} 条, 爆仓: {len(liq_df)} 条")
         return kline_df, macro_df, flow_df, liq_df
 
     def plot(self, hours: int = 24):
@@ -191,7 +201,7 @@ class MarketDashboard:
             gridspec_kw={'height_ratios': [1, 1]}
         )
 
-        fig.suptitle(f"{self.symbol} Market Dashboard (last {hours} Hours)", fontsize=16, fontweight='bold')
+        fig.suptitle(f"{self.symbol} Market Dashboard ({self.interval}, last {hours} Hours)", fontsize=16, fontweight='bold')
 
         # ========== 上图: K线、未平仓量、资金费率、爆仓 ==========
         # 绘制K线价格
@@ -228,12 +238,8 @@ class MarketDashboard:
             funding_pct = macro_df['funding_rate'] * 100
             colors_fr = [color_fr_pos if x >= 0 else color_fr_neg for x in funding_pct]
 
-            # 计算柱宽
-            if len(macro_df) > 1:
-                time_diff = (macro_df['event_time'].iloc[1] - macro_df['event_time'].iloc[0]).total_seconds()
-                bar_width_fr = time_diff / 86400 * 0.8
-            else:
-                bar_width_fr = 0.02
+            # 计算柱宽（根据 interval 参数）
+            bar_width_fr = self._interval_to_seconds() / 86400 * 0.8
 
             ax1_fr.bar(macro_df['event_time'], funding_pct,
                        width=bar_width_fr, alpha=0.6, color=colors_fr)
@@ -295,12 +301,8 @@ class MarketDashboard:
             color_net = '#9B59B6'
             color_cumsum = '#F39C12'  # 橙色 - 累计净流量
 
-            # 计算柱宽
-            if len(flow_df) > 1:
-                time_diff = (flow_df['event_time'].iloc[1] - flow_df['event_time'].iloc[0]).total_seconds()
-                bar_width = time_diff / 86400 * 0.35
-            else:
-                bar_width = 0.01
+            # 计算柱宽（根据 interval 参数）
+            bar_width = self._interval_to_seconds() / 86400 * 0.35
 
             # 柱状图: 买入/卖出
             ax2.bar(flow_df['event_time'], flow_df['buy_volume'],
@@ -351,10 +353,12 @@ def main():
     parser = argparse.ArgumentParser(description='市场全景可视化工具')
     parser.add_argument('--symbol', '-s', default='BTCUSDT', help='交易对')
     parser.add_argument('--hours', '-H', type=int, default=48, help='显示最近多少小时')
+    parser.add_argument('--interval', '-i', default='1M',
+                        help='K线周期 (如 1M, 5M, 15M, 60M DAY  等)')
 
     args = parser.parse_args()
 
-    dashboard = MarketDashboard(symbol=args.symbol)
+    dashboard = MarketDashboard(symbol=args.symbol, interval=args.interval)
     if dashboard.connect():
         try:
             dashboard.plot(hours=args.hours)
