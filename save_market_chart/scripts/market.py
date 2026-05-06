@@ -235,11 +235,11 @@ class MarketDashboard:
             # 计算柱宽（根据 interval 参数，系数0.8让柱子更密集）
             bar_width = self._interval_to_seconds() / 86400 * 0.8
 
-            # 柱状图: 买入/卖出
-            ax1_flow.bar(flow_df['event_time'], flow_df['buy_volume'],
-                         width=bar_width, alpha=0.4, color=color_buy, label='Buy Volume')
-            ax1_flow.bar(flow_df['event_time'], -flow_df['sell_volume'],
-                         width=bar_width, alpha=0.4, color=color_sell, label='Sell Volume')
+            # 阶梯填充图: 买入/卖出 (代替柱状图以解决高密度显示问题)
+            ax1_flow.fill_between(flow_df['event_time'], flow_df['buy_volume'], 0,
+                                  step='mid', alpha=0.5, color=color_buy, label='Buy Volume')
+            ax1_flow.fill_between(flow_df['event_time'], -flow_df['sell_volume'], 0,
+                                  step='mid', alpha=0.5, color=color_sell, label='Sell Volume')
             ax1_flow.set_ylabel('Volume (BTC)', fontsize=11)
             ax1_flow.spines['right'].set_position(('outward', 60))
 
@@ -288,8 +288,8 @@ class MarketDashboard:
         # 上图图例
         legend_elements_top = [
             plt.Line2D([0], [0], color='black', linewidth=2.0, label='Close Price'),
-            Patch(facecolor='#27AE60', alpha=0.4, label='Buy Volume'),
-            Patch(facecolor='#E74C3C', alpha=0.4, label='Sell Volume'),
+            Patch(facecolor='#27AE60', alpha=0.5, label='Buy Volume'),
+            Patch(facecolor='#E74C3C', alpha=0.5, label='Sell Volume'),
             plt.Line2D([0], [0], color='#F39C12', linewidth=2.0, label='Cumulative Net Flow'),
             plt.scatter([], [], c='#2ECC71', s=50, alpha=0.5, label='Short Liq'),
             plt.scatter([], [], c='#E74C3C', s=50, alpha=0.5, label='Long Liq'),
@@ -305,19 +305,20 @@ class MarketDashboard:
             ax2.set_ylabel('OI (K BTC)', color=color_oi, fontsize=11)
             ax2.tick_params(axis='y', labelcolor=color_oi)
 
-            # 资金费率柱状图（右Y轴1）
+            # 资金费率填充图（右Y轴1）
             ax2_fr = ax2.twinx()
             color_fr_pos = '#E74C3C'  # 红色 - 正费率
             color_fr_neg = '#9B59B6'  # 紫色 - 负费率
 
             funding_pct = macro_df['funding_rate'] * 100
-            colors_fr = [color_fr_pos if x >= 0 else color_fr_neg for x in funding_pct]
-
-            # 计算柱宽（根据 interval 参数）
-            bar_width_fr = self._interval_to_seconds() / 86400 * 0.8
-
-            ax2_fr.bar(macro_df['event_time'], funding_pct,
-                       width=bar_width_fr, alpha=0.6, color=colors_fr)
+            
+            # 分别填充正负费率以支持不同颜色
+            ax2_fr.fill_between(macro_df['event_time'], funding_pct, 0, 
+                                where=(funding_pct >= 0), step='mid',
+                                alpha=0.6, color=color_fr_pos, label='+Funding Rate')
+            ax2_fr.fill_between(macro_df['event_time'], funding_pct, 0, 
+                                where=(funding_pct < 0), step='mid',
+                                alpha=0.6, color=color_fr_neg, label='-Funding Rate')
 
             ax2_fr.set_ylabel('Funding Rate (%)', fontsize=11)
             ax2_fr.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
